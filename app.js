@@ -28,7 +28,17 @@ const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
 const badge = cls => `<span class="badge" style="background:${CLASSES[cls].color}">${CLASSES[cls].sym}</span>`;
 
+const START_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+const LIVE_DEPTH = 20;
+// Estimated rating anchors: [accuracy, rating].
+const RATING_CURVE = [[0, 100], [40, 300], [50, 500], [60, 750], [70, 1050], [75, 1250], [80, 1500], [85, 1800], [90, 2150], [93, 2400], [96, 2700], [98, 2950], [100, 3200]];
+
 let game = null, cur = 0, flipped = false, runId = 0, engines = [];
+// Variation being tried on the board: { base, pos, fens, moves, evals }, or null when following the game.
+let explore = null, sel = null, drag = null;
+const live = { eng: null, want: null, busy: false, running: false };
+const curFen = () => explore ? explore.fens[explore.pos] : game ? game.fens[cur] : START_FEN;
+const curPly = () => explore ? explore.base + explore.pos : cur;
 const book = { prefixes: new Set(), names: new Map() };
 
 // ---------- engine ----------
@@ -53,7 +63,7 @@ class Engine {
     await this.waitFor('isready', 'readyok');
   }
   // Resolves to up to 2 lines [{cp | mate, pv: [uci]}], scores from white's point of view.
-  analyze(fen, depth) {
+  analyze(fen, depth, onUpdate) {
     const sign = fen.split(' ')[1] === 'w' ? 1 : -1, lines = [];
     return new Promise(resolve => {
       this.listener = l => {
@@ -64,6 +74,8 @@ class Engine {
         const m = l.match(/^info .*?\bdepth (\d+) .*?\bmultipv (\d+) .*?\bscore (cp|mate) (-?\d+)( \w+bound)? .*?\bpv (.+)$/);
         if (!m || m[5]) return;
         lines[m[2] - 1] = { depth: +m[1], [m[3]]: sign * m[4], pv: m[6].trim().split(/\s+/) };
+        const found = lines.filter(Boolean);
+        if (onUpdate && found.every(x => x.depth === +m[1])) onUpdate([...found]);
       };
       this.send('position fen ' + fen);
       this.send('go depth ' + depth);
@@ -74,6 +86,36 @@ class Engine {
 function killEngines() {
   engines.forEach(e => e.worker.terminate());
   engines = [];
+}
+
+// Analyze the explored position in the background, replacing any analysis already in flight.
+function liveAnalyze(x, idx) {
+  if (live.busy && !live.want && live.cur?.x === x && live.cur.idx === idx) return;
+  live.want = { x, idx };
+  live.eng ??= new Engine();
+  if (live.busy) live.eng.send('stop');
+  pumpLive();
+}
+
+async function pumpLive() {
+  if (live.running) return;
+  live.running = true;
+  await live.eng.ready;
+  while (live.want) {
+    const { x, idx } = live.cur = live.want;
+    live.want = null;
+    live.busy = true;
+    const update = lines => {
+      if (explore !== x || idx >= x.fens.length) return;
+      if (x.evals[idx]?.[0].depth > lines[0].depth) return;
+      x.evals[idx] = lines;
+      if (x.pos === idx || x.pos === idx + 1) renderLive();
+    };
+    const lines = await live.eng.analyze(x.fens[idx], LIVE_DEPTH, update);
+    live.busy = false;
+    if (!live.want) { lines.final = true; update(lines); }
+  }
+  live.running = false;
 }
 
 function terminalEval(fen) {
@@ -112,19 +154,34 @@ function isSacrifice(m) {
   return val - (defended ? cheapest : 0) - gain >= 1;
 }
 
+function judge(m, before, after) {
+  const pov = line => m.color === 'w' ? winPct(line) : 100 - winPct(line);
+  const top = before[0], wb = pov(top), wa = pov(after[0]);
+  const isBest = top.pv[0] === m.uci || before.length === 1 && top.pv.length > 0 && wa >= wb;
+  const loss = isBest ? 0 : Math.max(0, wb - wa);
+  const cls = isBest ? 'best' : loss <= 2 ? 'excellent' : loss <= 5 ? 'good' : loss <= 10 ? 'inaccuracy' : loss <= 20 ? 'mistake' : 'blunder';
+  return { pov, top, wb, wa, isBest, loss, cls };
+}
+
+// Rough rating guess from accuracy, pulled halfway toward the player's actual rating when it is known.
+function estimateRating(acc, elo) {
+  const i = Math.max(1, RATING_CURVE.findIndex(([a]) => a >= acc));
+  const [a0, r0] = RATING_CURVE[i - 1], [a1, r1] = RATING_CURVE[i];
+  let r = r0 + (r1 - r0) * (acc - a0) / (a1 - a0);
+  if (elo > 0) r = (r + elo) / 2;
+  return Math.round(r / 50) * 50;
+}
+
 function classify(g) {
   const { moves, evals } = g;
   const sans = [];
   let inBook = true;
   g.opening = '';
   moves.forEach((m, i) => {
-    const pov = line => m.color === 'w' ? winPct(line) : 100 - winPct(line);
-    const before = evals[i], top = before[0];
-    const wb = pov(top), wa = pov(evals[i + 1][0]);
-    const isBest = top.pv[0] === m.uci || before.length === 1 && top.pv.length > 0 && wa >= wb;
-    const loss = isBest ? 0 : Math.max(0, wb - wa);
+    const before = evals[i];
+    const j = judge(m, before, evals[i + 1]), { pov, top, wb, wa, isBest, loss } = j;
     const prev = moves[i - 1];
-    let cls;
+    let cls = j.cls;
 
     sans.push(m.san);
     const key = sans.join(' ');
@@ -133,7 +190,6 @@ function classify(g) {
       if (book.names.has(key)) g.opening = book.names.get(key);
     } else {
       inBook = false;
-      cls = isBest ? 'best' : loss <= 2 ? 'excellent' : loss <= 5 ? 'good' : loss <= 10 ? 'inaccuracy' : loss <= 20 ? 'mistake' : 'blunder';
       const prevBad = prev && ['mistake', 'blunder', 'miss'].includes(prev.review.cls);
       const recapture = m.captured && prev?.captured && prev.to === m.to;
       if (loss <= 2 && wa >= 50 && (wb < 97.5 || before.length > 1 && pov(before[1]) <= 90) && isSacrifice(m)) cls = 'brilliant';
@@ -149,9 +205,11 @@ function classify(g) {
 
   g.accuracy = {};
   g.counts = {};
+  g.rating = {};
   for (const c of ['w', 'b']) {
     const own = moves.filter(m => m.color === c);
     g.accuracy[c] = own.length ? own.reduce((s, m) => s + m.review.acc, 0) / own.length : 0;
+    g.rating[c] = estimateRating(g.accuracy[c], parseInt(c === 'w' ? g.headers.WhiteElo : g.headers.BlackElo));
     g.counts[c] = Object.fromEntries(Object.keys(CLASSES).map(k => [k, own.filter(m => m.review.cls === k).length]));
   }
 }
@@ -206,6 +264,7 @@ async function startReview(pgn, asBlack = false) {
   }
   game = g;
   cur = 0;
+  explore = sel = null;
   flipped = asBlack;
   $('#view-load').hidden = true;
   $('#view-review').hidden = false;
@@ -313,7 +372,8 @@ function sqXY(sq) {
 }
 
 function renderBoard() {
-  const fen = game ? game.fens[cur] : new Chess().fen();
+  if (drag) return;
+  const fen = curFen(), ex = explore;
   const pieces = {};
   fen.split(' ')[0].split('/').forEach((row, i) => {
     let f = 0;
@@ -322,26 +382,30 @@ function renderBoard() {
       else pieces['abcdefgh'[f++] + (8 - i)] = (ch === ch.toUpperCase() ? 'w' : 'b') + ch.toUpperCase();
     }
   });
-  const move = game && cur > 0 ? game.moves[cur - 1] : null;
+  const move = ex?.pos ? ex.moves[ex.pos - 1] : game && cur > 0 ? game.moves[cur - 1] : null;
   const rev = move?.review;
   const color = rev ? CLASSES[rev.cls].color : '#f5f682';
   let html = '';
   for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) {
     const f = flipped ? 7 - x : x, r = flipped ? y : 7 - y;
     const sq = 'abcdefgh'[f] + (r + 1);
-    html += `<div class="sq ${(f + r) % 2 ? 'light' : 'dark'}${y === 0 ? ' edge-top' : ''}${x === 7 ? ' edge-right' : ''}">`;
+    html += `<div class="sq ${(f + r) % 2 ? 'light' : 'dark'}${y === 0 ? ' edge-top' : ''}${x === 7 ? ' edge-right' : ''}" data-sq="${sq}">`;
     if (move && (sq === move.from || sq === move.to)) html += `<div class="hl" style="background:${color}"></div>`;
+    if (sel?.sq === sq) html += '<div class="hl" style="background:#f5f682"></div>';
     if (x === 0) html += `<span class="coord rank">${r + 1}</span>`;
     if (y === 7) html += `<span class="coord file">${'abcdefgh'[f]}</span>`;
     if (pieces[sq]) html += `<img src="vendor/pieces/${pieces[sq]}.svg" alt="" draggable="false">`;
     if (rev && sq === move.to) html += `<span class="badge" style="background:${color}">${CLASSES[rev.cls].sym}</span>`;
+    if (sel?.targets.includes(sq)) html += `<span class="dot${pieces[sq] ? ' cap' : ''}"></span>`;
     html += '</div>';
   }
   $('#board').innerHTML = html;
 
+  // Following the game: the move that should have been played. Exploring: the engine's suggestion from here.
   let arrow = '';
-  if (rev && !rev.isBest && rev.cls !== 'book' && rev.bestUci) {
-    const [x1, y1] = sqXY(rev.bestUci.slice(0, 2)), [x2, y2] = sqXY(rev.bestUci.slice(2, 4));
+  const hint = ex ? ex.evals[ex.pos]?.[0]?.pv[0] : rev && !rev.isBest && rev.cls !== 'book' && rev.bestUci;
+  if (hint) {
+    const [x1, y1] = sqXY(hint.slice(0, 2)), [x2, y2] = sqXY(hint.slice(2, 4));
     const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy), ux = dx / len, uy = dy / len;
     const ex = x2 + .5 - ux * .32, ey = y2 + .5 - uy * .32;
     arrow = `<g fill="#81b64c" stroke="#81b64c" opacity=".85">
@@ -364,7 +428,7 @@ function renderPlayers() {
 }
 
 function renderEval() {
-  const line = game?.evals?.[cur]?.[0];
+  const line = explore ? explore.evals[explore.pos]?.[0] : game?.evals?.[cur]?.[0];
   const wp = line ? winPct(line) : 50;
   $('#evalbar').classList.toggle('flipped', flipped);
   $('#evalbar-fill').style.height = wp + '%';
@@ -378,6 +442,8 @@ function renderEval() {
 function renderCoach() {
   const coach = $('#coach'), lines = $('#lines');
   lines.innerHTML = '';
+  $('#explore').hidden = !explore;
+  if (explore) return renderExplore();
   if (!game.evals) {
     coach.innerHTML = '<span class="muted">The review will appear here once the analysis finishes. You can step through the game meanwhile.</span>';
     return;
@@ -390,23 +456,66 @@ function renderCoach() {
     const alt = !rev.isBest && rev.cls !== 'book' && rev.bestSan ? ` The best move was <b>${esc(rev.bestSan)}</b>.` : '';
     coach.innerHTML = `${badge(rev.cls)}<span><b>${no}${esc(m.san)}</b> is ${CLASSES[rev.cls].phrase}.${alt}</span>${ev}`;
   }
-  lines.innerHTML = game.evals[cur].filter(l => l.pv.length).map(l => {
-    const sans = pvToSan(game.fens[cur], l.pv);
-    let no = Math.floor(cur / 2) + 1, white = cur % 2 === 0, text = white ? '' : no + '... ';
-    for (const s of sans) {
-      if (white) text += no + '. ';
-      text += s + ' ';
-      if (!white) no++;
-      white = !white;
-    }
-    return `<div class="line"><span class="ev${winPct(l) < 50 ? ' neg' : ''}">${evalText(l)}</span>${esc(text)}</div>`;
-  }).join('');
+  lines.innerHTML = linesHtml(game.evals[cur]);
+}
+
+// Numbered SAN text for moves starting at the given ply (0 = White's first move).
+function numbered(sans, ply) {
+  let no = Math.floor(ply / 2) + 1, white = ply % 2 === 0, text = white ? '' : no + '... ';
+  for (const s of sans) {
+    if (white) text += no + '. ';
+    text += s + ' ';
+    if (!white) no++;
+    white = !white;
+  }
+  return text;
+}
+
+function linesHtml(evalLines) {
+  return evalLines.filter(l => l.pv.length).map(l =>
+    `<div class="line"><span class="ev${winPct(l) < 50 ? ' neg' : ''}">${evalText(l)}</span>${esc(numbered(pvToSan(curFen(), l.pv), curPly()))}</div>`).join('');
+}
+
+function renderExplore() {
+  const x = explore, ev = x.evals[x.pos], prevEv = x.evals[x.pos - 1], m = x.moves[x.pos - 1];
+  const trail = x.moves.map((mv, i) => {
+    const t = numbered([mv.san], x.base + i).trim();
+    const label = i && mv.color === 'b' ? mv.san : t;
+    return `<span class="xm${i === x.pos - 1 ? ' cur' : ''}" data-pos="${i + 1}">${esc(label)}</span>`;
+  }).join(' ');
+  $('#explore-line').innerHTML = `<b>Trying:</b> ${trail}`;
+
+  let text = '';
+  if (m) {
+    if (ev && prevEv) {
+      const j = judge(m, prevEv, ev);
+      const bestSan = j.top.pv[0] ? pvToSan(x.fens[x.pos - 1], [j.top.pv[0]])[0] : '';
+      m.review = { cls: j.cls, isBest: j.isBest };
+      text = `${badge(j.cls)}<span><b>${esc(numbered([m.san], x.base + x.pos - 1).trim())}</b> is ${CLASSES[j.cls].phrase}.${!j.isBest && bestSan ? ` Best was <b>${esc(bestSan)}</b>.` : ''}`;
+    } else text = `<span><b>${esc(numbered([m.san], x.base + x.pos - 1).trim())}</b>`;
+  } else text = '<span>';
+  if (!ev) text += ' Stockfish is thinking...</span>';
+  else {
+    const next = ev[0].pv[0] && pvToSan(curFen(), [ev[0].pv[0]])[0];
+    text += next ? ` Stockfish suggests <b>${esc(next)}</b> next.</span>` : ' Game over.</span>';
+    const depth = ev[0].depth ? `<span class="muted"> d${ev[0].depth}</span>` : '';
+    text += `<span class="eval">${evalText(ev[0])}${depth}</span>`;
+    $('#lines').innerHTML = linesHtml(ev);
+  }
+  $('#coach').innerHTML = text;
+}
+
+function renderLive() {
+  renderCoach();
+  renderBoard();
+  renderEval();
 }
 
 function renderSummary() {
   const h = game.headers, a = game.accuracy;
   let html = `<details open><summary>Game summary</summary><table><tr><th>${esc(h.White || 'White')}</th><th></th><th>${esc(h.Black || 'Black')}</th></tr>
-    <tr class="accrow"><td><span class="accbox w">${a.w.toFixed(1)}</span></td><td class="label">Accuracy</td><td><span class="accbox b">${a.b.toFixed(1)}</span></td></tr>`;
+    <tr class="accrow"><td><span class="accbox w">${a.w.toFixed(1)}</span></td><td class="label">Accuracy</td><td><span class="accbox b">${a.b.toFixed(1)}</span></td></tr>
+    <tr class="accrow" title="Rough estimate from move accuracy, blended with the player's actual rating when known"><td><span class="accbox w">${game.rating.w}</span></td><td class="label">Est. rating</td><td><span class="accbox b">${game.rating.b}</span></td></tr>`;
   for (const [k, c] of Object.entries(CLASSES)) {
     html += `<tr><td class="n" style="color:${c.color}">${game.counts.w[k]}</td><td class="label">${badge(k)}${c.label}</td><td class="n" style="color:${c.color}">${game.counts.b[k]}</td></tr>`;
   }
@@ -458,6 +567,12 @@ function renderGraph() {
 }
 
 function render() {
+  const x = explore;
+  if (x && !x.evals[x.pos]?.final) {
+    const done = terminalEval(x.fens[x.pos]);
+    if (done) x.evals[x.pos] = Object.assign(done, { final: true });
+    else liveAnalyze(x, x.pos);
+  }
   renderBoard();
   renderPlayers();
   renderEval();
@@ -474,14 +589,74 @@ function render() {
 
 function go(ply) {
   if (!game) return;
+  explore = sel = null;
   cur = Math.max(0, Math.min(game.fens.length - 1, ply));
   render();
 }
 
 function nav(action) {
+  sel = null;
   if (action === 'flip') { flipped = !flipped; render(); }
+  else if (explore && action === 'prev' && explore.pos > 0) { explore.pos--; render(); }
+  else if (explore && action === 'next') { if (explore.pos < explore.moves.length) { explore.pos++; render(); } }
+  else if (explore && action === 'prev') go(cur);
   else go({ start: 0, prev: cur - 1, next: cur + 1, end: Infinity }[action]);
 }
+
+// Play a move on the board: follows the game if it matches the next game move, otherwise starts or extends a variation.
+function playMove(from, to) {
+  sel = null;
+  const mv = new Chess(curFen()).move({ from, to, promotion: 'q' });
+  const uci = from + to + (mv.promotion || '');
+  if (!explore) {
+    if (game.moves[cur]?.uci === uci) return go(cur + 1);
+    const known = game.evals?.[cur];
+    explore = { base: cur, pos: 0, fens: [game.fens[cur]], moves: [], evals: [known && Object.assign([...known], { final: true })] };
+  }
+  const x = explore;
+  if (x.moves[x.pos]?.uci !== uci) {
+    x.moves.length = x.pos;
+    x.fens.length = x.evals.length = x.pos + 1;
+    x.moves.push({ san: mv.san, from, to, color: mv.color, uci });
+    x.fens.push(mv.after);
+  }
+  x.pos++;
+  render();
+}
+
+const boardEl = $('#board');
+boardEl.addEventListener('pointerdown', e => {
+  const sq = e.target.closest('.sq')?.dataset.sq;
+  if (!game || e.button || !sq) return;
+  e.preventDefault();
+  if (sel?.targets.includes(sq)) return playMove(sel.sq, sq);
+  const targets = new Chess(curFen()).moves({ square: sq, verbose: true }).map(m => m.to);
+  sel = targets.length ? { sq, targets } : null;
+  renderBoard();
+  const img = sel && boardEl.querySelector(`[data-sq="${sq}"] img`);
+  if (!img) return;
+  img.style.zIndex = 5;
+  img.style.pointerEvents = 'none';
+  drag = { img, sq, x: e.clientX, y: e.clientY, moved: false };
+  boardEl.setPointerCapture(e.pointerId);
+});
+boardEl.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  drag.moved ||= Math.hypot(dx, dy) > 4;
+  if (drag.moved) drag.img.style.transform = `translate(${dx}px,${dy}px)`;
+});
+const endDrag = e => {
+  if (!drag) return;
+  const d = drag;
+  drag = null;
+  const to = d.moved && e.type === 'pointerup' && document.elementFromPoint(e.clientX, e.clientY)?.closest('.sq')?.dataset.sq;
+  if (to && sel?.targets.includes(to)) return playMove(d.sq, to);
+  if (d.moved && to !== d.sq) sel = null;
+  renderLive();
+};
+boardEl.addEventListener('pointerup', endDrag);
+boardEl.addEventListener('pointercancel', endDrag);
 
 // ---------- events ----------
 
@@ -494,6 +669,11 @@ $('#btn-new').onclick = () => {
   $('#view-review').hidden = true;
   $('#view-load').hidden = false;
   $('#btn-new').hidden = true;
+};
+$('#btn-back').onclick = () => go(cur);
+$('#explore-line').onclick = e => {
+  const el = e.target.closest('.xm');
+  if (el && explore) { sel = null; explore.pos = +el.dataset.pos; render(); }
 };
 $('#moves').onclick = e => { const el = e.target.closest('.mv'); if (el) go(+el.dataset.ply); };
 $('.nav').onclick = e => { const b = e.target.closest('button'); if (b) nav(b.dataset.nav); };
