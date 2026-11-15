@@ -37,9 +37,14 @@ let game = null, cur = 0, flipped = false, runId = 0, engines = [];
 // Variation being tried on the board: { base, pos, fens, moves, evals }, or null when following the game.
 let explore = null, sel = null, drag = null;
 const live = { eng: null, want: null, busy: false, running: false };
-const curFen = () => explore ? explore.fens[explore.pos] : game ? game.fens[cur] : START_FEN;
+const curFen = () => mode === 'openings' ? (trainer ? trainer.line.fens[trainer.pos] : START_FEN) : explore ? explore.fens[explore.pos] : game ? game.fens[cur] : START_FEN;
 const curPly = () => explore ? explore.base + explore.pos : cur;
-const book = { prefixes: new Set(), names: new Map() };
+const book = { prefixes: new Set(), names: new Map(), families: new Map() };
+// Openings trainer: mode is 'review' or 'openings'; trainer is the line being learned or practiced.
+let mode = 'review', trainer = null;
+const op = { screen: 'browse', family: null, side: 'w' };
+let mastered = new Set();
+try { mastered = new Set(JSON.parse(localStorage.getItem('openings-mastered')) || []); } catch { /* nothing saved */ }
 
 // ---------- engine ----------
 
@@ -109,7 +114,7 @@ async function pumpLive() {
       if (explore !== x || idx >= x.fens.length) return;
       if (x.evals[idx]?.[0].depth > lines[0].depth) return;
       x.evals[idx] = lines;
-      if (x.pos === idx || x.pos === idx + 1) renderLive();
+      if (mode === 'review' && (x.pos === idx || x.pos === idx + 1)) renderLive();
     };
     const lines = await live.eng.analyze(x.fens[idx], LIVE_DEPTH, update);
     live.busy = false;
@@ -228,14 +233,26 @@ function pvToSan(fen, pv, max = 10) {
 async function loadBook() {
   const text = await (await fetch('vendor/openings.tsv')).text();
   for (const row of text.split('\n')) {
-    const [, name, pgn] = row.split('\t');
+    const [eco, name, pgn] = row.split('\t');
     if (!pgn) continue;
     const sans = pgn.replace(/\d+\.\s*/g, '').trim().split(/\s+/);
-    book.names.set(sans.join(' '), name);
+    const key = sans.join(' '), family = name.split(':')[0];
+    book.names.set(key, name);
+    if (!book.families.has(family)) book.families.set(family, { name: family, lines: [] });
+    book.families.get(family).lines.push({ eco, name, sans, key });
     for (let i = 1; i <= sans.length; i++) book.prefixes.add(sans.slice(0, i).join(' '));
   }
 }
 const bookReady = loadBook().catch(() => {});
+
+// Name of the deepest named opening along a sequence of SAN moves.
+function openingName(sans) {
+  for (let i = sans.length; i > 0; i--) {
+    const name = book.names.get(sans.slice(0, i).join(' '));
+    if (name) return name;
+  }
+  return '';
+}
 
 function parseGame(pgn) {
   pgn = pgn.trim();
@@ -382,7 +399,9 @@ function renderBoard() {
       else pieces['abcdefgh'[f++] + (8 - i)] = (ch === ch.toUpperCase() ? 'w' : 'b') + ch.toUpperCase();
     }
   });
-  const move = ex?.pos ? ex.moves[ex.pos - 1] : game && cur > 0 ? game.moves[cur - 1] : null;
+  const t = mode === 'openings' ? trainer : null;
+  const move = mode === 'openings' ? (t?.pos ? t.line.moves[t.pos - 1] : null)
+    : ex?.pos ? ex.moves[ex.pos - 1] : game && cur > 0 ? game.moves[cur - 1] : null;
   const rev = move?.review;
   const color = rev ? CLASSES[rev.cls].color : '#f5f682';
   let html = '';
@@ -403,7 +422,8 @@ function renderBoard() {
 
   // Following the game: the move that should have been played. Exploring: the engine's suggestion from here.
   let arrow = '';
-  const hint = ex ? ex.evals[ex.pos]?.[0]?.pv[0] : rev && !rev.isBest && rev.cls !== 'book' && rev.bestUci;
+  const hint = mode === 'openings' ? t && (t.tmode === 'learn' || t.hint) && t.line.moves[t.pos]?.uci
+    : ex ? ex.evals[ex.pos]?.[0]?.pv[0] : rev && !rev.isBest && rev.cls !== 'book' && rev.bestUci;
   if (hint) {
     const [x1, y1] = sqXY(hint.slice(0, 2)), [x2, y2] = sqXY(hint.slice(2, 4));
     const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy), ux = dx / len, uy = dy / len;
@@ -417,7 +437,7 @@ function renderBoard() {
 
 function renderPlayers() {
   const h = game?.headers ?? {};
-  const row = c => {
+  const row = mode === 'openings' ? c => `<span>${c === 'w' ? 'White' : 'Black'}${c === op.side ? ' (you)' : ''}</span>` : c => {
     const name = (c === 'w' ? h.White : h.Black) || (c === 'w' ? 'White' : 'Black');
     const elo = c === 'w' ? h.WhiteElo : h.BlackElo;
     const acc = game?.accuracy ? `<span class="acc">Accuracy ${game.accuracy[c].toFixed(1)}</span>` : '';
@@ -428,6 +448,7 @@ function renderPlayers() {
 }
 
 function renderEval() {
+  $('#evalbar').style.visibility = mode === 'openings' ? 'hidden' : '';
   const line = explore ? explore.evals[explore.pos]?.[0] : game?.evals?.[cur]?.[0];
   const wp = line ? winPct(line) : 50;
   $('#evalbar').classList.toggle('flipped', flipped);
@@ -567,6 +588,7 @@ function renderGraph() {
 }
 
 function render() {
+  if (mode === 'openings') return renderOpenings();
   const x = explore;
   if (x && !x.evals[x.pos]?.final) {
     const done = terminalEval(x.fens[x.pos]);
@@ -603,9 +625,199 @@ function nav(action) {
   else go({ start: 0, prev: cur - 1, next: cur + 1, end: Infinity }[action]);
 }
 
+// ---------- openings trainer ----------
+
+function setMode(m) {
+  mode = m;
+  sel = null;
+  document.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
+  $('#view-openings').hidden = m !== 'openings';
+  $('#view-load').hidden = m !== 'review' || !!game;
+  $('#view-review').hidden = m !== 'review' || !game;
+  $('#btn-new').hidden = m !== 'review' || !game;
+  if (m === 'openings') {
+    flipped = op.side === 'b';
+    bookReady.then(renderOpList);
+  }
+  render();
+}
+
+function renderOpList() {
+  const q = $('#op-search').value.trim().toLowerCase();
+  const fams = [...book.families.values()]
+    .filter(f => !q || f.name.toLowerCase().includes(q) || f.lines.some(l => l.name.toLowerCase().includes(q) || l.eco.toLowerCase() === q))
+    .sort((a, b) => b.lines.length - a.lines.length || a.name.localeCompare(b.name));
+  $('#op-status').textContent = `${fams.length} openings, ${book.names.size} lines` + (fams.length > 150 ? ' - showing the largest 150, search to narrow down' : '');
+  $('#op-list').innerHTML = fams.slice(0, 150).map(f => {
+    const done = f.lines.filter(l => mastered.has(l.key)).length;
+    return `<div class="game" data-family="${esc(f.name)}"><span class="names">${esc(f.name)}</span>
+      <span class="muted">${done}/${f.lines.length} mastered</span></div>`;
+  }).join('');
+}
+
+function openFamily(name) {
+  op.family = book.families.get(name);
+  op.screen = 'family';
+  op.side = /Defen[cs]e|Counter/i.test(name) ? 'b' : 'w';
+  flipped = op.side === 'b';
+  trainer = null;
+  render();
+}
+
+function openLine(line, tmode) {
+  if (!line.fens) {
+    const c = new Chess();
+    line.fens = [c.fen()];
+    line.moves = line.sans.map(san => {
+      const m = c.move(san);
+      line.fens.push(m.after);
+      return { san: m.san, from: m.from, to: m.to, color: m.color, uci: m.from + m.to + (m.promotion || '') };
+    });
+  }
+  trainer = { line, tmode, pos: 0, mistakes: 0, wrong: 0, hint: false, done: false, waiting: false, msg: '' };
+  op.screen = 'train';
+  sel = null;
+  flipped = op.side === 'b';
+  if (tmode === 'practice') opponentTurn();
+  render();
+}
+
+// In practice mode, finish the line or let the opponent reply after a short pause.
+function opponentTurn() {
+  const t = trainer;
+  if (t.pos >= t.line.moves.length) {
+    t.done = true;
+    if (!t.mistakes) {
+      mastered.add(t.line.key);
+      localStorage.setItem('openings-mastered', JSON.stringify([...mastered]));
+    }
+  } else if (t.line.moves[t.pos].color !== op.side) {
+    t.waiting = true;
+    setTimeout(() => {
+      if (trainer !== t) return;
+      t.waiting = false;
+      t.pos++;
+      opponentTurn();
+      render();
+    }, 450);
+  }
+}
+
+function trainerMove(from, to) {
+  const t = trainer, want = t.line.moves[t.pos];
+  if (!want) return render();
+  if (want.from === from && want.to === to) {
+    t.pos++;
+    t.wrong = 0;
+    t.hint = false;
+    t.msg = '';
+    if (t.tmode === 'practice') opponentTurn();
+  } else {
+    const san = new Chess(curFen()).move({ from, to, promotion: 'q' }).san;
+    const sans = [...t.line.sans.slice(0, t.pos), san];
+    const other = book.prefixes.has(sans.join(' ')) && openingName(sans);
+    t.msg = other ? `<b>${esc(san)}</b> is also theory (${esc(other)}), but this line plays something else.`
+      : `<b>${esc(san)}</b> is not the move in this line. Try again.`;
+    if (t.tmode === 'practice') {
+      t.mistakes++;
+      if (++t.wrong >= 2) t.hint = true;
+    }
+  }
+  render();
+}
+
+// Next line to drill: a random one not yet mastered, falling back to any other line in the family.
+function nextLine() {
+  const lines = op.family.lines.filter(l => l !== trainer?.line);
+  const todo = lines.filter(l => !mastered.has(l.key));
+  const pool = todo.length ? todo : lines.length ? lines : op.family.lines;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function opNav(action) {
+  const t = trainer;
+  if (action === 'flip') flipped = !flipped;
+  else if (t?.tmode === 'learn') {
+    const n = t.line.moves.length;
+    t.pos = Math.max(0, Math.min(n, { start: 0, prev: t.pos - 1, next: t.pos + 1, end: n }[action]));
+    t.msg = '';
+    sel = null;
+  }
+  render();
+}
+
+function familyHtml() {
+  const f = op.family, done = f.lines.filter(l => mastered.has(l.key)).length;
+  const seg = (side, label) => `<button class="seg${op.side === side ? ' on' : ''}" data-act="side" data-side="${side}">${label}</button>`;
+  return `<div><button class="ghost" data-act="browse">&larr; All openings</button></div>
+    <div class="card"><h2>${esc(f.name)}</h2>
+      <div class="muted">${f.lines.length} lines, ${done} mastered</div>
+      <div class="row"><span class="muted">Play as</span>${seg('w', 'White')}${seg('b', 'Black')}
+        <button data-act="drill" style="margin-left:auto">Practice random line</button></div></div>
+    <div id="op-lines">${f.lines.map((l, i) => `<div class="game" data-line="${i}">
+      <span class="res win">${mastered.has(l.key) ? '\u2713' : ''}</span>
+      <span class="names"><b>${esc(l.name === f.name ? 'Main line' : l.name.slice(f.name.length + 2))}</b><br><span class="muted">${esc(l.eco)} &middot; ${esc(numbered(l.sans, 0))}</span></span>
+      <button class="ghost" data-act="learn" data-line="${i}">Learn</button></div>`).join('')}</div>`;
+}
+
+function trainHtml() {
+  const t = trainer, L = t.line, n = L.moves.length, learn = t.tmode === 'learn';
+  const side = op.side === 'w' ? 'White' : 'Black';
+  const shown = learn ? n : t.pos;
+  const moves = L.moves.slice(0, shown).map((m, i) =>
+    `<span class="xm${i === t.pos - 1 ? ' cur' : ''}"${learn ? ` data-pos="${i + 1}"` : ''}>${esc(i && m.color === 'b' ? m.san : numbered([m.san], i).trim())}</span>`).join(' ');
+  let status;
+  if (learn) status = t.pos < n ? `Next is <b>${esc(numbered([L.sans[t.pos]], t.pos).trim())}</b>. Play it on the board or press the right arrow.` : 'End of the line. Ready to practice it from memory?';
+  else if (t.done) status = t.mistakes ? `Line complete with ${t.mistakes} mistake${t.mistakes > 1 ? 's' : ''}. Repeat it without mistakes or hints to master it.` : 'Line complete with no mistakes. Mastered!';
+  else status = t.waiting ? 'Opponent is moving...' : `Your move as ${side}.` + (t.hint ? ' The arrow shows the move.' : '');
+  const buttons = learn
+    ? `<button class="ghost" data-act="nav" data-nav="start">&#x23EE;&#xFE0E;</button><button class="ghost" data-act="nav" data-nav="prev">&#x25C0;&#xFE0E;</button>
+       <button class="ghost" data-act="nav" data-nav="next">&#x25B6;&#xFE0E;</button><button data-act="practice">Practice this line</button>`
+    : `${t.done ? '' : '<button class="ghost" data-act="hint">Hint</button>'}<button class="ghost" data-act="restart">Restart</button>
+       <button class="ghost" data-act="tolearn">Learn</button><button${t.done ? '' : ' class="ghost"'} data-act="drill">Next line</button>`;
+  return `<div><button class="ghost" data-act="family">&larr; ${esc(op.family.name)}</button></div>
+    <div class="card"><h2>${esc(L.name)}</h2>
+      <div class="muted">${esc(L.eco)} &middot; ${learn ? 'Learning' : 'Practicing'} as ${side}${mastered.has(L.key) ? ' &middot; mastered' : ''}</div></div>
+    <div class="card">${t.msg ? `<div class="error" style="margin:0 0 6px">${t.msg}</div>` : ''}${status}</div>
+    <div class="card" id="op-moves">${moves || '<span class="muted">No moves yet</span>'}</div>
+    <div class="muted">${esc(openingName(L.sans.slice(0, t.pos)) || 'Starting position')}</div>
+    <div class="nav">${buttons}</div>`;
+}
+
+function renderOpenings() {
+  renderBoard();
+  renderPlayers();
+  renderEval();
+  $('#op-browse').hidden = op.screen !== 'browse';
+  const d = $('#op-detail');
+  d.hidden = op.screen === 'browse';
+  if (op.screen !== 'browse') d.innerHTML = op.screen === 'family' ? familyHtml() : trainHtml();
+}
+
+$('#op-search').oninput = renderOpList;
+$('#op-list').onclick = e => { const el = e.target.closest('[data-family]'); if (el) openFamily(el.dataset.family); };
+$('#op-detail').onclick = e => {
+  const b = e.target.closest('[data-act]'), row = e.target.closest('[data-line]'), xm = e.target.closest('.xm[data-pos]');
+  const t = trainer;
+  const act = b?.dataset.act;
+  if (act === 'browse') { op.screen = 'browse'; trainer = null; renderOpList(); render(); }
+  else if (act === 'family') { op.screen = 'family'; trainer = null; render(); }
+  else if (act === 'side') { op.side = b.dataset.side; flipped = op.side === 'b'; render(); }
+  else if (act === 'drill') openLine(nextLine(), 'practice');
+  else if (act === 'learn') openLine(op.family.lines[b.dataset.line], 'learn');
+  else if (act === 'practice' || act === 'restart') openLine(t.line, 'practice');
+  else if (act === 'tolearn') openLine(t.line, 'learn');
+  else if (act === 'hint') { if (!t.hint) t.mistakes++; t.hint = true; render(); }
+  else if (act === 'nav') opNav(b.dataset.nav);
+  else if (xm) { t.pos = +xm.dataset.pos; t.msg = ''; render(); }
+  else if (row) openLine(op.family.lines[row.dataset.line], 'practice');
+};
+document.querySelectorAll('.tab').forEach(b => b.onclick = () => setMode(b.dataset.mode));
+
 // Play a move on the board: follows the game if it matches the next game move, otherwise starts or extends a variation.
 function playMove(from, to) {
   sel = null;
+  if (mode === 'openings') return trainerMove(from, to);
   const mv = new Chess(curFen()).move({ from, to, promotion: 'q' });
   const uci = from + to + (mv.promotion || '');
   if (!explore) {
@@ -627,7 +839,7 @@ function playMove(from, to) {
 const boardEl = $('#board');
 boardEl.addEventListener('pointerdown', e => {
   const sq = e.target.closest('.sq')?.dataset.sq;
-  if (!game || e.button || !sq) return;
+  if (!(mode === 'openings' ? trainer && !trainer.done && !trainer.waiting : game) || e.button || !sq) return;
   e.preventDefault();
   if (sel?.targets.includes(sq)) return playMove(sel.sq, sq);
   const targets = new Chess(curFen()).moves({ square: sq, verbose: true }).map(m => m.to);
@@ -653,7 +865,7 @@ const endDrag = e => {
   const to = d.moved && e.type === 'pointerup' && document.elementFromPoint(e.clientX, e.clientY)?.closest('.sq')?.dataset.sq;
   if (to && sel?.targets.includes(to)) return playMove(d.sq, to);
   if (d.moved && to !== d.sq) sel = null;
-  renderLive();
+  render();
 };
 boardEl.addEventListener('pointerup', endDrag);
 boardEl.addEventListener('pointercancel', endDrag);
@@ -676,16 +888,18 @@ $('#explore-line').onclick = e => {
   if (el && explore) { sel = null; explore.pos = +el.dataset.pos; render(); }
 };
 $('#moves').onclick = e => { const el = e.target.closest('.mv'); if (el) go(+el.dataset.ply); };
-$('.nav').onclick = e => { const b = e.target.closest('button'); if (b) nav(b.dataset.nav); };
+$('#view-review .nav').onclick = e => { const b = e.target.closest('button'); if (b) nav(b.dataset.nav); };
 $('#graph').onclick = e => {
   if (!game) return;
   const r = e.currentTarget.getBoundingClientRect();
   go(Math.round((e.clientX - r.left) / r.width * (game.fens.length - 1)));
 };
 document.addEventListener('keydown', e => {
-  if (!game || /INPUT|TEXTAREA|SELECT/.test(e.target.tagName) || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (/INPUT|TEXTAREA|SELECT/.test(e.target.tagName) || e.ctrlKey || e.metaKey || e.altKey) return;
   const action = { ArrowLeft: 'prev', ArrowRight: 'next', Home: 'start', End: 'end', ArrowUp: 'start', ArrowDown: 'end', f: 'flip' }[e.key];
-  if (action) { e.preventDefault(); nav(action); }
+  if (!action || mode === 'review' && !game) return;
+  e.preventDefault();
+  (mode === 'openings' ? opNav : nav)(action);
 });
 addEventListener('resize', renderGraph);
 
@@ -695,3 +909,4 @@ try {
 } catch { /* no saved user */ }
 render();
 if (location.hash === '#sample') $('#btn-sample').click();
+if (location.hash === '#openings') setMode('openings');

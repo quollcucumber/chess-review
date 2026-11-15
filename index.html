@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Game Review</title>
+<title>Chess Review &amp; Openings</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -22,7 +22,7 @@
 
   <aside class="panel">
     <header class="panel-head">
-      <h1>Game Review</h1>
+      <div class="tabs"><button class="tab on" data-mode="review">Game Review</button><button class="tab" data-mode="openings">Openings</button></div>
       <button id="btn-new" class="ghost" hidden>New game</button>
     </header>
 
@@ -79,6 +79,15 @@
         <button data-nav="end" title="End (End)">&#x23ED;&#xFE0E;</button>
         <button data-nav="flip" title="Flip board (F)">&#x21C5;</button>
       </div>
+    </div>
+
+    <div id="view-openings" class="view" hidden>
+      <div id="op-browse">
+        <input id="op-search" placeholder="Search openings (e.g. Sicilian, London, C50)" autocomplete="off" spellcheck="false">
+        <div id="op-status" class="muted"></div>
+        <div id="op-list"></div>
+      </div>
+      <div id="op-detail" hidden></div>
     </div>
   </aside>
 </div>

@@ -132,3 +132,19 @@ textarea { width: 100%; height: 110px; resize: vertical; font-family: ui-monospa
 #explore .xm { cursor: pointer; padding: 1px 3px; border-radius: 3px; }
 #explore .xm.cur { background: #4b4845; font-weight: 700; }
 #explore button { flex: none; }
+
+.tabs { display: flex; gap: 4px; }
+.tab { background: none; border-color: transparent; color: #9e9b97; font-size: 15px; }
+.tab.on { background: #3c3a37; color: #fff; }
+.seg { background: #3c3a37; border-color: #55524e; color: #e8e6e3; font-weight: 400; }
+.seg.on { background: #81b64c; border-color: #81b64c; color: #fff; font-weight: 600; }
+#op-browse, #op-detail { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+#op-search { width: 100%; }
+#op-lines .game { align-items: flex-start; }
+#op-lines .names { white-space: normal; }
+#op-lines .res { width: 16px; flex: none; }
+#op-moves { line-height: 1.9; }
+#op-moves .xm { padding: 1px 3px; border-radius: 3px; }
+#op-moves .xm[data-pos] { cursor: pointer; }
+#op-moves .xm.cur { background: #4b4845; font-weight: 700; }
+#op-detail .nav button.ghost { font-size: 14px; }
