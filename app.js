@@ -41,8 +41,10 @@ const live = { eng: null, want: null, busy: false, running: false };
 const GUESS_POINTS = { best: 100, excellent: 90, good: 70, inaccuracy: 40, mistake: 15, blunder: 0 };
 const gs = { eng: null, chain: Promise.resolve(), pool: [], drawn: 0, token: 0, pos: null, loading: false, error: '', stats: { n: 0, total: 0, best: 0, streak: 0 } };
 try { Object.assign(gs.stats, JSON.parse(localStorage.getItem('guess-stats'))); } catch { /* nothing saved */ }
-const curFen = () => mode === 'guess' ? gs.pos?.shown ?? START_FEN : mode === 'openings' ? (trainer ? trainer.line.fens[trainer.pos] : START_FEN) : explore ? explore.fens[explore.pos] : game ? game.fens[cur] : START_FEN;
-const curPly = () => explore ? explore.base + explore.pos : cur;
+// The variation currently being tried on the board, if any (game review or an answered guess position).
+const activeX = () => mode === 'guess' ? gs.pos?.x : mode === 'review' ? explore : null;
+const curFen = () => mode === 'guess' ? (gs.pos?.x ? gs.pos.x.fens[gs.pos.x.pos] : gs.pos?.shown) ?? START_FEN : mode === 'openings' ? (trainer ? trainer.line.fens[trainer.pos] : START_FEN) : explore ? explore.fens[explore.pos] : game ? game.fens[cur] : START_FEN;
+const curPly = () => { const x = activeX(); return x ? x.base + x.pos : cur; };
 const book = { prefixes: new Set(), names: new Map(), families: new Map() };
 // Openings trainer: mode is 'review' or 'openings'; trainer is the line being learned or practiced.
 let mode = 'review', trainer = null;
@@ -115,10 +117,10 @@ async function pumpLive() {
     live.want = null;
     live.busy = true;
     const update = lines => {
-      if (explore !== x || idx >= x.fens.length) return;
+      if (activeX() !== x || idx >= x.fens.length) return;
       if (x.evals[idx]?.[0].depth > lines[0].depth) return;
       x.evals[idx] = lines;
-      if (mode === 'review' && (x.pos === idx || x.pos === idx + 1)) renderLive();
+      if (x.pos === idx || x.pos === idx + 1) mode === 'review' ? renderLive() : render();
     };
     const lines = await live.eng.analyze(x.fens[idx], LIVE_DEPTH, update);
     live.busy = false;
@@ -404,7 +406,8 @@ function renderBoard() {
     }
   });
   const t = mode === 'openings' ? trainer : null, gp = gs.pos;
-  const move = mode === 'guess' ? gp?.user ?? gp?.last : mode === 'openings' ? (t?.pos ? t.line.moves[t.pos - 1] : null)
+  const gx = gp?.x;
+  const move = mode === 'guess' ? (gx ? (gx.pos ? gx.moves[gx.pos - 1] : gp.last) : gp?.user ?? gp?.last) : mode === 'openings' ? (t?.pos ? t.line.moves[t.pos - 1] : null)
     : ex?.pos ? ex.moves[ex.pos - 1] : game && cur > 0 ? game.moves[cur - 1] : null;
   const rev = move?.review;
   const color = rev ? CLASSES[rev.cls].color : '#f5f682';
@@ -426,7 +429,7 @@ function renderBoard() {
 
   // Following the game: the move that should have been played. Exploring: the engine's suggestion from here.
   let arrow = '';
-  const hint = mode === 'guess' ? gp?.state === 'done' && !gp.user?.review.isBest && gp.bestUci : mode === 'openings' ? t && (t.tmode === 'learn' || t.hint) && t.line.moves[t.pos]?.uci
+  const hint = mode === 'guess' ? gx && (gx.pos === 1 && gx.moves[0] === gp.user && !gp.user.review.isBest ? gp.bestUci : gx.evals[gx.pos]?.[0]?.pv[0]) : mode === 'openings' ? t && (t.tmode === 'learn' || t.hint) && t.line.moves[t.pos]?.uci
     : ex ? ex.evals[ex.pos]?.[0]?.pv[0] : rev && !rev.isBest && rev.cls !== 'book' && rev.bestUci;
   if (hint) {
     const [x1, y1] = sqXY(hint.slice(0, 2)), [x2, y2] = sqXY(hint.slice(2, 4));
@@ -454,7 +457,7 @@ function renderPlayers() {
 function renderEval() {
   const gp = mode === 'guess' ? gs.pos : null;
   $('#evalbar').style.visibility = mode === 'openings' || mode === 'guess' && gp?.state !== 'done' ? 'hidden' : '';
-  const line = mode === 'guess' ? (gp?.afterEval ?? gp?.baseEval)?.[0] : explore ? explore.evals[explore.pos]?.[0] : game?.evals?.[cur]?.[0];
+  const line = mode === 'guess' ? gp?.x?.evals[gp.x.pos]?.[0] : explore ? explore.evals[explore.pos]?.[0] : game?.evals?.[cur]?.[0];
   const wp = line ? winPct(line) : 50;
   $('#evalbar').classList.toggle('flipped', flipped);
   $('#evalbar-fill').style.height = wp + '%';
@@ -469,7 +472,13 @@ function renderCoach() {
   const coach = $('#coach'), lines = $('#lines');
   lines.innerHTML = '';
   $('#explore').hidden = !explore;
-  if (explore) return renderExplore();
+  if (explore) {
+    const r = exploreParts(explore);
+    $('#explore-line').innerHTML = `<b>Trying:</b> ${r.trail}`;
+    coach.innerHTML = r.coach;
+    lines.innerHTML = r.lines;
+    return;
+  }
   if (!game.evals) {
     coach.innerHTML = '<span class="muted">The review will appear here once the analysis finishes. You can step through the game meanwhile.</span>';
     return;
@@ -502,16 +511,15 @@ function linesHtml(evalLines) {
     `<div class="line"><span class="ev${winPct(l) < 50 ? ' neg' : ''}">${evalText(l)}</span>${esc(numbered(pvToSan(curFen(), l.pv), curPly()))}</div>`).join('');
 }
 
-function renderExplore() {
-  const x = explore, ev = x.evals[x.pos], prevEv = x.evals[x.pos - 1], m = x.moves[x.pos - 1];
+// HTML for a variation: the clickable move trail, the verdict on the current move, and the engine lines.
+function exploreParts(x) {
+  const ev = x.evals[x.pos], prevEv = x.evals[x.pos - 1], m = x.moves[x.pos - 1];
   const trail = x.moves.map((mv, i) => {
     const t = numbered([mv.san], x.base + i).trim();
     const label = i && mv.color === 'b' ? mv.san : t;
     return `<span class="xm${i === x.pos - 1 ? ' cur' : ''}" data-pos="${i + 1}">${esc(label)}</span>`;
   }).join(' ');
-  $('#explore-line').innerHTML = `<b>Trying:</b> ${trail}`;
-
-  let text = '';
+  let text = '', lines = '';
   if (m) {
     if (ev && prevEv) {
       const j = judge(m, prevEv, ev);
@@ -526,9 +534,9 @@ function renderExplore() {
     text += next ? ` Stockfish suggests <b>${esc(next)}</b> next.</span>` : ' Game over.</span>';
     const depth = ev[0].depth ? `<span class="muted"> d${ev[0].depth}</span>` : '';
     text += `<span class="eval">${evalText(ev[0])}${depth}</span>`;
-    $('#lines').innerHTML = linesHtml(ev);
+    lines = linesHtml(ev);
   }
-  $('#coach').innerHTML = text;
+  return { trail, coach: text, lines };
 }
 
 function renderLive() {
@@ -592,15 +600,18 @@ function renderGraph() {
   ctx.fillRect(Math.min(w - 2 * dpr, X(cur)), 0, 2 * dpr, h);
 }
 
+// Make sure the current position of a variation has (or is getting) an engine evaluation.
+function ensureEval(x) {
+  if (!x || x.evals[x.pos]?.final) return;
+  const done = terminalEval(x.fens[x.pos]);
+  if (done) x.evals[x.pos] = Object.assign(done, { final: true });
+  else liveAnalyze(x, x.pos);
+}
+
 function render() {
   if (mode === 'openings') return renderOpenings();
   if (mode === 'guess') return renderGuess();
-  const x = explore;
-  if (x && !x.evals[x.pos]?.final) {
-    const done = terminalEval(x.fens[x.pos]);
-    if (done) x.evals[x.pos] = Object.assign(done, { final: true });
-    else liveAnalyze(x, x.pos);
-  }
+  ensureEval(explore);
   renderBoard();
   renderPlayers();
   renderEval();
@@ -896,6 +907,9 @@ function finishGuess(p, before, after) {
     st.streak = p.points >= 70 ? st.streak + 1 : 0;
   } else st.streak = 0;
   localStorage.setItem('guess-stats', JSON.stringify(st));
+  const final = lines => Object.assign([...lines], { final: true });
+  p.x = { base: p.ply, pos: 0, fens: [p.fen], moves: [], evals: [final(before)] };
+  if (after) Object.assign(p.x, { pos: 1, fens: [p.fen, p.shown], moves: [p.user], evals: [final(before), final(after)] });
   p.state = 'done';
   render();
 }
@@ -919,11 +933,18 @@ async function revealGuess() {
 }
 
 function guessNav(action) {
-  if (action === 'flip') { flipped = !flipped; render(); }
-  else if (action === 'next' && gs.pos?.state === 'done') nextPosition();
+  const x = gs.pos?.x;
+  if (action === 'new') { if (x) nextPosition(); return; }
+  if (action === 'flip') flipped = !flipped;
+  else if (x) {
+    sel = null;
+    x.pos = Math.max(0, Math.min(x.moves.length, { start: 0, prev: x.pos - 1, next: x.pos + 1, end: x.moves.length }[action]));
+  }
+  render();
 }
 
 function renderGuess() {
+  ensureEval(gs.pos?.x);
   renderBoard();
   renderPlayers();
   renderEval();
@@ -943,9 +964,12 @@ function renderGuess() {
       let text = u ? `<b>${esc(u.san)}</b> is ${CLASSES[u.review.cls].phrase} (+${p.points} points).` : '';
       if (!u?.review.isBest) text += ` Stockfish prefers <b>${esc(p.bestSan)}</b>.`;
       text += ` In the game, ${esc(who)} played <b>${esc(p.played.san)}</b>${p.played.uci === p.bestUci ? ", the engine's top choice" : u && p.played.uci === u.uci ? ', same as you' : ''}.`;
+      const r = exploreParts(p.x);
       html += `<div class="card" id="g-result">${u ? badge(u.review.cls) : ''}<span>${text}</span></div>
-        <div class="card" id="g-lines">${p.baseEval.filter(l => l.pv.length).map(l =>
-          `<div class="line"><span class="ev${winPct(l) < 50 ? ' neg' : ''}">${evalText(l)}</span>${esc(numbered(pvToSan(p.fen, l.pv), p.ply))}</div>`).join('')}</div>
+        <div class="card" id="g-explore"><div id="g-trail">${r.trail ? `<b>Trying:</b> ${r.trail}` : '<span class="muted">Play any move on the board to see what would happen.</span>'}</div>
+          ${p.x.pos ? '<button class="ghost" data-act="origin">Back to position</button>' : ''}</div>
+        <div class="card" id="g-coach">${r.coach}</div>
+        ${r.lines ? `<div class="card" id="g-lines">${r.lines}</div>` : ''}
         <div class="nav"><button data-act="next">Next position</button><button class="ghost" data-act="review">Review this game</button></div>`;
     }
   }
@@ -959,8 +983,10 @@ function renderGuess() {
 
 $('#g-source').onchange = () => { gs.pool = []; nextPosition(); };
 $('#g-body').onclick = e => {
-  const act = e.target.closest('[data-act]')?.dataset.act;
-  if (act === 'next') nextPosition();
+  const act = e.target.closest('[data-act]')?.dataset.act, xm = e.target.closest('.xm');
+  if (xm && gs.pos?.x) { sel = null; gs.pos.x.pos = +xm.dataset.pos; render(); }
+  else if (act === 'origin') { sel = null; gs.pos.x.pos = 0; render(); }
+  else if (act === 'next') nextPosition();
   else if (act === 'reveal') revealGuess();
   else if (act === 'reset') { Object.assign(gs.stats, { n: 0, total: 0, best: 0, streak: 0 }); localStorage.removeItem('guess-stats'); render(); }
   else if (act === 'review') { const p = gs.pos; setMode('review'); startReview(p.g.pgn, p.played.color === 'b'); }
@@ -970,29 +996,37 @@ $('#g-body').onclick = e => {
 function playMove(from, to) {
   sel = null;
   if (mode === 'openings') return trainerMove(from, to);
-  if (mode === 'guess') return guessMove(from, to);
+  if (mode === 'guess' && gs.pos.state === 'guess') return guessMove(from, to);
   const mv = new Chess(curFen()).move({ from, to, promotion: 'q' });
   const uci = from + to + (mv.promotion || '');
+  if (mode === 'guess') {
+    extendLine(gs.pos.x, mv, uci);
+    return render();
+  }
   if (!explore) {
     if (game.moves[cur]?.uci === uci) return go(cur + 1);
     const known = game.evals?.[cur];
     explore = { base: cur, pos: 0, fens: [game.fens[cur]], moves: [], evals: [known && Object.assign([...known], { final: true })] };
   }
-  const x = explore;
+  extendLine(explore, mv, uci);
+  render();
+}
+
+// Step a variation forward by a move, dropping whatever followed if the move is a new one.
+function extendLine(x, mv, uci) {
   if (x.moves[x.pos]?.uci !== uci) {
     x.moves.length = x.pos;
     x.fens.length = x.evals.length = x.pos + 1;
-    x.moves.push({ san: mv.san, from, to, color: mv.color, uci });
+    x.moves.push({ san: mv.san, from: mv.from, to: mv.to, color: mv.color, uci });
     x.fens.push(mv.after);
   }
   x.pos++;
-  render();
 }
 
 const boardEl = $('#board');
 boardEl.addEventListener('pointerdown', e => {
   const sq = e.target.closest('.sq')?.dataset.sq;
-  const active = mode === 'guess' ? gs.pos?.state === 'guess' : mode === 'openings' ? trainer && !trainer.done && !trainer.waiting : game;
+  const active = mode === 'guess' ? gs.pos && gs.pos.state !== 'thinking' : mode === 'openings' ? trainer && !trainer.done && !trainer.waiting : game;
   if (!active || e.button || !sq) return;
   e.preventDefault();
   if (sel?.targets.includes(sq)) return playMove(sel.sq, sq);
@@ -1050,8 +1084,8 @@ $('#graph').onclick = e => {
 };
 document.addEventListener('keydown', e => {
   if (/INPUT|TEXTAREA|SELECT/.test(e.target.tagName) || e.ctrlKey || e.metaKey || e.altKey) return;
-  const action = { ArrowLeft: 'prev', ArrowRight: 'next', Home: 'start', End: 'end', ArrowUp: 'start', ArrowDown: 'end', f: 'flip', n: 'next' }[e.key];
-  if (!action || mode === 'review' && !game) return;
+  const action = { ArrowLeft: 'prev', ArrowRight: 'next', Home: 'start', End: 'end', ArrowUp: 'start', ArrowDown: 'end', f: 'flip', n: 'new' }[e.key];
+  if (!action || mode === 'review' && !game || action === 'new' && mode !== 'guess') return;
   e.preventDefault();
   (mode === 'guess' ? guessNav : mode === 'openings' ? opNav : nav)(action);
 });
