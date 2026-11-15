@@ -101,8 +101,9 @@ function killEngines() {
 
 // Analyze the explored position in the background, replacing any analysis already in flight.
 function liveAnalyze(x, idx) {
-  if (live.busy && !live.want && live.cur?.x === x && live.cur.idx === idx) return;
-  live.want = { x, idx };
+  const fen = x.fens[idx];
+  if (live.busy && !live.want && live.cur?.x === x && live.cur.fen === fen) return;
+  live.want = { x, idx, fen };
   live.eng ??= new Engine();
   if (live.busy) live.eng.send('stop');
   pumpLive();
@@ -113,16 +114,16 @@ async function pumpLive() {
   live.running = true;
   await live.eng.ready;
   while (live.want) {
-    const { x, idx } = live.cur = live.want;
+    const { x, idx, fen } = live.cur = live.want;
     live.want = null;
     live.busy = true;
     const update = lines => {
-      if (activeX() !== x || idx >= x.fens.length) return;
+      if (activeX() !== x || x.fens[idx] !== fen) return;
       if (x.evals[idx]?.[0].depth > lines[0].depth) return;
       x.evals[idx] = lines;
       if (x.pos === idx || x.pos === idx + 1) mode === 'review' ? renderLive() : render();
     };
-    const lines = await live.eng.analyze(x.fens[idx], LIVE_DEPTH, update);
+    const lines = await live.eng.analyze(fen, LIVE_DEPTH, update);
     live.busy = false;
     if (!live.want) { lines.final = true; update(lines); }
   }
