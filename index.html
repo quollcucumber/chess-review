@@ -22,7 +22,7 @@
 
   <aside class="panel">
     <header class="panel-head">
-      <div class="tabs"><button class="tab on" data-mode="review">Game Review</button><button class="tab" data-mode="openings">Openings</button></div>
+      <div class="tabs"><button class="tab on" data-mode="review">Game Review</button><button class="tab" data-mode="openings">Openings</button><button class="tab" data-mode="guess">Guess the Move</button></div>
       <button id="btn-new" class="ghost" hidden>New game</button>
     </header>
 
@@ -88,6 +88,18 @@
         <div id="op-list"></div>
       </div>
       <div id="op-detail" hidden></div>
+    </div>
+
+    <div id="view-guess" class="view" hidden>
+      <label class="row" style="margin:0"><span class="muted">Positions from</span>
+        <select id="g-source">
+          <option value="rapid">Top players - rapid (Lichess)</option>
+          <option value="blitz">Top players - blitz (Lichess)</option>
+          <option value="classical">Top players - classical (Lichess)</option>
+          <option value="mine">My games (username from Game Review tab)</option>
+        </select>
+      </label>
+      <div id="g-body"></div>
     </div>
   </aside>
 </div>

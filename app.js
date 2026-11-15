@@ -37,7 +37,11 @@ let game = null, cur = 0, flipped = false, runId = 0, engines = [];
 // Variation being tried on the board: { base, pos, fens, moves, evals }, or null when following the game.
 let explore = null, sel = null, drag = null;
 const live = { eng: null, want: null, busy: false, running: false };
-const curFen = () => mode === 'openings' ? (trainer ? trainer.line.fens[trainer.pos] : START_FEN) : explore ? explore.fens[explore.pos] : game ? game.fens[cur] : START_FEN;
+// Guess-the-move: a random position from a real game; the engine grades the move you pick.
+const GUESS_POINTS = { best: 100, excellent: 90, good: 70, inaccuracy: 40, mistake: 15, blunder: 0 };
+const gs = { eng: null, chain: Promise.resolve(), pool: [], drawn: 0, token: 0, pos: null, loading: false, error: '', stats: { n: 0, total: 0, best: 0, streak: 0 } };
+try { Object.assign(gs.stats, JSON.parse(localStorage.getItem('guess-stats'))); } catch { /* nothing saved */ }
+const curFen = () => mode === 'guess' ? gs.pos?.shown ?? START_FEN : mode === 'openings' ? (trainer ? trainer.line.fens[trainer.pos] : START_FEN) : explore ? explore.fens[explore.pos] : game ? game.fens[cur] : START_FEN;
 const curPly = () => explore ? explore.base + explore.pos : cur;
 const book = { prefixes: new Set(), names: new Map(), families: new Map() };
 // Openings trainer: mode is 'review' or 'openings'; trainer is the line being learned or practiced.
@@ -344,8 +348,8 @@ async function fetchChessCom(user) {
   }));
 }
 
-async function fetchLichess(user) {
-  const url = `https://lichess.org/api/games/user/${encodeURIComponent(user)}?max=40&pgnInJson=true`;
+async function fetchLichess(user, extra = '', max = 40) {
+  const url = `https://lichess.org/api/games/user/${encodeURIComponent(user)}?max=${max}&pgnInJson=true${extra}`;
   const text = await (await getJSON(url, { headers: { Accept: 'application/x-ndjson' } })).text();
   return text.split('\n').filter(Boolean).map(l => JSON.parse(l)).filter(x => x.variant === 'standard' && x.pgn).map(x => ({
     white: x.players.white.user?.name ?? 'Anonymous', whiteElo: x.players.white.rating,
@@ -399,8 +403,8 @@ function renderBoard() {
       else pieces['abcdefgh'[f++] + (8 - i)] = (ch === ch.toUpperCase() ? 'w' : 'b') + ch.toUpperCase();
     }
   });
-  const t = mode === 'openings' ? trainer : null;
-  const move = mode === 'openings' ? (t?.pos ? t.line.moves[t.pos - 1] : null)
+  const t = mode === 'openings' ? trainer : null, gp = gs.pos;
+  const move = mode === 'guess' ? gp?.user ?? gp?.last : mode === 'openings' ? (t?.pos ? t.line.moves[t.pos - 1] : null)
     : ex?.pos ? ex.moves[ex.pos - 1] : game && cur > 0 ? game.moves[cur - 1] : null;
   const rev = move?.review;
   const color = rev ? CLASSES[rev.cls].color : '#f5f682';
@@ -422,7 +426,7 @@ function renderBoard() {
 
   // Following the game: the move that should have been played. Exploring: the engine's suggestion from here.
   let arrow = '';
-  const hint = mode === 'openings' ? t && (t.tmode === 'learn' || t.hint) && t.line.moves[t.pos]?.uci
+  const hint = mode === 'guess' ? gp?.state === 'done' && !gp.user?.review.isBest && gp.bestUci : mode === 'openings' ? t && (t.tmode === 'learn' || t.hint) && t.line.moves[t.pos]?.uci
     : ex ? ex.evals[ex.pos]?.[0]?.pv[0] : rev && !rev.isBest && rev.cls !== 'book' && rev.bestUci;
   if (hint) {
     const [x1, y1] = sqXY(hint.slice(0, 2)), [x2, y2] = sqXY(hint.slice(2, 4));
@@ -436,11 +440,11 @@ function renderBoard() {
 }
 
 function renderPlayers() {
-  const h = game?.headers ?? {};
+  const h = (mode === 'guess' ? gs.pos?.g.parsed.headers : game?.headers) ?? {};
   const row = mode === 'openings' ? c => `<span>${c === 'w' ? 'White' : 'Black'}${c === op.side ? ' (you)' : ''}</span>` : c => {
     const name = (c === 'w' ? h.White : h.Black) || (c === 'w' ? 'White' : 'Black');
     const elo = c === 'w' ? h.WhiteElo : h.BlackElo;
-    const acc = game?.accuracy ? `<span class="acc">Accuracy ${game.accuracy[c].toFixed(1)}</span>` : '';
+    const acc = mode === 'review' && game?.accuracy ? `<span class="acc">Accuracy ${game.accuracy[c].toFixed(1)}</span>` : '';
     return `<span>${esc(name)}</span>${elo && elo !== '?' ? `<span class="elo">(${esc(elo)})</span>` : ''}${acc}`;
   };
   $('#player-top').innerHTML = row(flipped ? 'w' : 'b');
@@ -448,8 +452,9 @@ function renderPlayers() {
 }
 
 function renderEval() {
-  $('#evalbar').style.visibility = mode === 'openings' ? 'hidden' : '';
-  const line = explore ? explore.evals[explore.pos]?.[0] : game?.evals?.[cur]?.[0];
+  const gp = mode === 'guess' ? gs.pos : null;
+  $('#evalbar').style.visibility = mode === 'openings' || mode === 'guess' && gp?.state !== 'done' ? 'hidden' : '';
+  const line = mode === 'guess' ? (gp?.afterEval ?? gp?.baseEval)?.[0] : explore ? explore.evals[explore.pos]?.[0] : game?.evals?.[cur]?.[0];
   const wp = line ? winPct(line) : 50;
   $('#evalbar').classList.toggle('flipped', flipped);
   $('#evalbar-fill').style.height = wp + '%';
@@ -589,6 +594,7 @@ function renderGraph() {
 
 function render() {
   if (mode === 'openings') return renderOpenings();
+  if (mode === 'guess') return renderGuess();
   const x = explore;
   if (x && !x.evals[x.pos]?.final) {
     const done = terminalEval(x.fens[x.pos]);
@@ -632,9 +638,11 @@ function setMode(m) {
   sel = null;
   document.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
   $('#view-openings').hidden = m !== 'openings';
+  $('#view-guess').hidden = m !== 'guess';
   $('#view-load').hidden = m !== 'review' || !!game;
   $('#view-review').hidden = m !== 'review' || !game;
   $('#btn-new').hidden = m !== 'review' || !game;
+  if (m === 'guess' && !gs.pos && !gs.loading) return nextPosition();
   if (m === 'openings') {
     flipped = op.side === 'b';
     bookReady.then(renderOpList);
@@ -814,10 +822,155 @@ $('#op-detail').onclick = e => {
 };
 document.querySelectorAll('.tab').forEach(b => b.onclick = () => setMode(b.dataset.mode));
 
+// ---------- guess the move ----------
+
+// Queue an analysis on the guess engine; requests run one at a time.
+function guessAnalyze(fen, depth) {
+  gs.eng ??= new Engine();
+  const p = gs.chain.then(async () => {
+    await gs.eng.ready;
+    return terminalEval(fen) ?? gs.eng.analyze(fen, depth);
+  });
+  gs.chain = p.catch(() => {});
+  return p;
+}
+
+async function loadPool() {
+  const src = $('#g-source').value;
+  if (src === 'mine') {
+    const user = $('#username').value.trim();
+    if (!user) throw new Error('Enter your username on the Game Review tab first, then come back.');
+    return $('#site').value === 'lichess' ? fetchLichess(user) : fetchChessCom(user);
+  }
+  const { users } = await (await getJSON(`https://lichess.org/api/player/top/50/${src}`)).json();
+  const pick = users[Math.floor(Math.random() * users.length)];
+  return fetchLichess(pick.username, `&perfType=${src}&rated=true`, 20);
+}
+
+async function nextPosition() {
+  const token = ++gs.token;
+  gs.error = '';
+  gs.pos = sel = null;
+  gs.eng?.send('stop');
+  if (!gs.pool.length || gs.drawn >= 10) {
+    gs.loading = true;
+    render();
+    let pool = [], error = '';
+    try { pool = await loadPool(); } catch (e) { error = e.message; }
+    if (token !== gs.token) return;
+    Object.assign(gs, { pool, error, drawn: 0, loading: false });
+  }
+  for (let tries = 0; tries < 40 && gs.pool.length && !gs.pos; tries++) {
+    const g = gs.pool[Math.floor(Math.random() * gs.pool.length)];
+    try { g.parsed ??= parseGame(g.pgn); } catch { continue; }
+    const { moves, fens } = g.parsed;
+    if (moves.length < 24 || moves[0].before !== START_FEN) continue;
+    const ply = 12 + Math.floor(Math.random() * (moves.length - 13));
+    gs.pos = { g, ply, fen: fens[ply], shown: fens[ply], last: moves[ply - 1], played: moves[ply], state: 'guess', user: null };
+  }
+  if (!gs.pos) {
+    gs.error ||= 'No suitable games found. Try another source.';
+    return render();
+  }
+  gs.drawn++;
+  flipped = gs.pos.played.color === 'b';
+  gs.pos.base = guessAnalyze(gs.pos.fen, 16);
+  render();
+}
+
+// Grade the guess (or reveal the answer when after is null) once the engine has looked at the position.
+function finishGuess(p, before, after) {
+  if (gs.pos !== p) return;
+  p.baseEval = before;
+  p.bestUci = before[0].pv[0];
+  p.bestSan = pvToSan(p.fen, [p.bestUci])[0];
+  const st = gs.stats;
+  st.n++;
+  if (after) {
+    const j = judge(p.user, before, after);
+    p.user.review = { cls: j.cls, isBest: j.isBest };
+    p.afterEval = after;
+    p.points = GUESS_POINTS[j.cls];
+    st.total += p.points;
+    st.best += j.isBest ? 1 : 0;
+    st.streak = p.points >= 70 ? st.streak + 1 : 0;
+  } else st.streak = 0;
+  localStorage.setItem('guess-stats', JSON.stringify(st));
+  p.state = 'done';
+  render();
+}
+
+async function guessMove(from, to) {
+  const p = gs.pos;
+  const mv = new Chess(p.fen).move({ from, to, promotion: 'q' });
+  p.user = { san: mv.san, from, to, color: mv.color, uci: from + to + (mv.promotion || '') };
+  p.shown = mv.after;
+  p.state = 'thinking';
+  render();
+  const after = guessAnalyze(mv.after, 15);
+  finishGuess(p, await p.base, await after);
+}
+
+async function revealGuess() {
+  const p = gs.pos;
+  p.state = 'thinking';
+  render();
+  finishGuess(p, await p.base, null);
+}
+
+function guessNav(action) {
+  if (action === 'flip') { flipped = !flipped; render(); }
+  else if (action === 'next' && gs.pos?.state === 'done') nextPosition();
+}
+
+function renderGuess() {
+  renderBoard();
+  renderPlayers();
+  renderEval();
+  const p = gs.pos, st = gs.stats;
+  let html;
+  if (gs.loading) html = '<div class="card">Loading games...</div>';
+  else if (!p) html = `<div class="card"><div class="error" style="margin:0 0 8px">${esc(gs.error)}</div><button data-act="next">Try again</button></div>`;
+  else {
+    const side = p.played.color === 'w' ? 'White' : 'Black';
+    html = `<div class="card"><h2>${side} to move</h2>
+      <div class="muted">Move ${Math.floor(p.ply / 2) + 1} &middot; ${esc(p.g.white)} (${esc(p.g.whiteElo ?? '?')}) vs ${esc(p.g.black)} (${esc(p.g.blackElo ?? '?')}) &middot; ${esc(p.g.type)}</div></div>`;
+    if (p.state === 'guess') html += `<div class="card">What would you play? Drag a piece, or click it and then its target square.</div>
+      <div class="nav"><button class="ghost" data-act="reveal">Show answer</button><button class="ghost" data-act="next">Skip</button></div>`;
+    else if (p.state === 'thinking') html += '<div class="card">Stockfish is checking...</div>';
+    else {
+      const u = p.user, who = p.played.color === 'w' ? p.g.white : p.g.black;
+      let text = u ? `<b>${esc(u.san)}</b> is ${CLASSES[u.review.cls].phrase} (+${p.points} points).` : '';
+      if (!u?.review.isBest) text += ` Stockfish prefers <b>${esc(p.bestSan)}</b>.`;
+      text += ` In the game, ${esc(who)} played <b>${esc(p.played.san)}</b>${p.played.uci === p.bestUci ? ", the engine's top choice" : u && p.played.uci === u.uci ? ', same as you' : ''}.`;
+      html += `<div class="card" id="g-result">${u ? badge(u.review.cls) : ''}<span>${text}</span></div>
+        <div class="card" id="g-lines">${p.baseEval.filter(l => l.pv.length).map(l =>
+          `<div class="line"><span class="ev${winPct(l) < 50 ? ' neg' : ''}">${evalText(l)}</span>${esc(numbered(pvToSan(p.fen, l.pv), p.ply))}</div>`).join('')}</div>
+        <div class="nav"><button data-act="next">Next position</button><button class="ghost" data-act="review">Review this game</button></div>`;
+    }
+  }
+  html += `<div class="card stats"><div><b>${st.n}</b><span class="muted">positions</span></div>
+    <div><b>${st.n ? Math.round(st.total / st.n) : 0}</b><span class="muted">avg score</span></div>
+    <div><b>${st.n ? Math.round(st.best / st.n * 100) : 0}%</b><span class="muted">best moves</span></div>
+    <div><b>${st.streak}</b><span class="muted">streak</span></div>
+    <button class="ghost" data-act="reset">Reset</button></div>`;
+  $('#g-body').innerHTML = html;
+}
+
+$('#g-source').onchange = () => { gs.pool = []; nextPosition(); };
+$('#g-body').onclick = e => {
+  const act = e.target.closest('[data-act]')?.dataset.act;
+  if (act === 'next') nextPosition();
+  else if (act === 'reveal') revealGuess();
+  else if (act === 'reset') { Object.assign(gs.stats, { n: 0, total: 0, best: 0, streak: 0 }); localStorage.removeItem('guess-stats'); render(); }
+  else if (act === 'review') { const p = gs.pos; setMode('review'); startReview(p.g.pgn, p.played.color === 'b'); }
+};
+
 // Play a move on the board: follows the game if it matches the next game move, otherwise starts or extends a variation.
 function playMove(from, to) {
   sel = null;
   if (mode === 'openings') return trainerMove(from, to);
+  if (mode === 'guess') return guessMove(from, to);
   const mv = new Chess(curFen()).move({ from, to, promotion: 'q' });
   const uci = from + to + (mv.promotion || '');
   if (!explore) {
@@ -839,7 +992,8 @@ function playMove(from, to) {
 const boardEl = $('#board');
 boardEl.addEventListener('pointerdown', e => {
   const sq = e.target.closest('.sq')?.dataset.sq;
-  if (!(mode === 'openings' ? trainer && !trainer.done && !trainer.waiting : game) || e.button || !sq) return;
+  const active = mode === 'guess' ? gs.pos?.state === 'guess' : mode === 'openings' ? trainer && !trainer.done && !trainer.waiting : game;
+  if (!active || e.button || !sq) return;
   e.preventDefault();
   if (sel?.targets.includes(sq)) return playMove(sel.sq, sq);
   const targets = new Chess(curFen()).moves({ square: sq, verbose: true }).map(m => m.to);
@@ -896,10 +1050,10 @@ $('#graph').onclick = e => {
 };
 document.addEventListener('keydown', e => {
   if (/INPUT|TEXTAREA|SELECT/.test(e.target.tagName) || e.ctrlKey || e.metaKey || e.altKey) return;
-  const action = { ArrowLeft: 'prev', ArrowRight: 'next', Home: 'start', End: 'end', ArrowUp: 'start', ArrowDown: 'end', f: 'flip' }[e.key];
+  const action = { ArrowLeft: 'prev', ArrowRight: 'next', Home: 'start', End: 'end', ArrowUp: 'start', ArrowDown: 'end', f: 'flip', n: 'next' }[e.key];
   if (!action || mode === 'review' && !game) return;
   e.preventDefault();
-  (mode === 'openings' ? opNav : nav)(action);
+  (mode === 'guess' ? guessNav : mode === 'openings' ? opNav : nav)(action);
 });
 addEventListener('resize', renderGraph);
 
@@ -910,3 +1064,4 @@ try {
 render();
 if (location.hash === '#sample') $('#btn-sample').click();
 if (location.hash === '#openings') setMode('openings');
+if (location.hash === '#guess') setMode('guess');
