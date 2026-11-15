@@ -117,16 +117,11 @@ textarea { width: 100%; height: 110px; resize: vertical; font-family: ui-monospa
 .nav { display: flex; gap: 6px; }
 .nav button { flex: 1; background: #3c3a37; border-color: #3c3a37; font-size: 16px; padding: 8px; }
 
-@media (max-width: 900px) {
-  .app { flex-direction: column; align-items: center; height: auto; --size: min(calc(100vw - 60px), 640px); }
-  .panel { width: 100%; max-width: 700px; }
-  #moves { max-height: 300px; }
-}
 
 .sq img { touch-action: none; cursor: grab; }
 .sq .dot { position: absolute; inset: 35%; border-radius: 50%; background: rgba(0,0,0,.22); pointer-events: none; z-index: 1; }
 .sq .dot.cap { inset: 4%; background: none; border: .9cqw solid rgba(0,0,0,.22); }
-#board { touch-action: none; }
+#board { touch-action: pan-y; }
 #explore { display: flex; gap: 10px; align-items: center; border: 1px solid #5c8bb0; }
 #explore-line { flex: 1; }
 #explore .xm { cursor: pointer; padding: 1px 3px; border-radius: 3px; }
@@ -173,3 +168,41 @@ textarea { width: 100%; height: 110px; resize: vertical; font-family: ui-monospa
 #g-coach { display: flex; gap: 10px; align-items: center; min-height: 54px; }
 #g-coach .badge { width: 20px; height: 20px; font-size: 11px; }
 #g-coach .eval { margin-left: auto; background: #1f1e1c; border-radius: 4px; padding: 2px 8px; font-weight: 700; white-space: nowrap; }
+
+/* Phones and small tablets, portrait: board pinned on top, panel scrolls underneath. */
+@media (max-width: 900px) and (orientation: portrait) {
+  html { touch-action: manipulation; }
+  .app { flex-direction: column; align-items: center; height: auto; gap: 6px; padding: 4px 6px 12px; --size: min(calc(100vw - 30px), 56vh, 640px); }
+  .board-col { position: sticky; top: 0; z-index: 20; background: #302e2b; gap: 2px; padding-bottom: 4px; width: 100%; align-items: center; }
+  .board-wrap { gap: 4px; }
+  #evalbar { width: 14px; }
+  #evalbar-text { display: none; }
+  .player { height: 22px; font-size: 13px; padding-left: 18px; width: calc(var(--size) + 18px); }
+  .panel { width: 100%; max-width: 700px; overflow: visible; }
+  .panel-head { padding: 6px 8px; gap: 6px; flex-wrap: wrap; }
+  .tab { padding: 6px 7px; font-size: 13px; white-space: nowrap; }
+  #btn-new { padding: 5px 8px; font-size: 12px; white-space: nowrap; }
+  .view { overflow: visible; padding: 8px; gap: 8px; }
+  input, select, textarea { font-size: 16px; }
+  #games { max-height: none; }
+  #moves { max-height: 240px; flex: none; }
+  #view-review > * { order: 5; }
+  #progress-box { order: 0; }
+  #explore { order: 1; }
+  #coach { order: 2; }
+  #view-review .nav { order: 3; }
+  #lines { order: 4; }
+  #summary { order: 9; }
+  .nav button { padding: 10px 8px; }
+}
+
+/* Phones in landscape: keep board and panel side by side. */
+@media (max-width: 900px) and (orientation: landscape) {
+  .app { gap: 10px; padding: 6px; height: 100dvh; --size: min(calc(100dvh - 68px), calc(50vw - 50px)); }
+  .player { height: 22px; font-size: 13px; }
+  .panel { width: auto; flex: 1; min-width: 0; }
+  .tab { padding: 6px 7px; font-size: 13px; white-space: nowrap; }
+  input, select, textarea { font-size: 16px; }
+}
+
+#moves { position: relative; }

@@ -622,7 +622,11 @@ function render() {
   document.querySelectorAll('#moves .mv').forEach(el => {
     const on = +el.dataset.ply === cur;
     el.classList.toggle('cur', on);
-    if (on) el.scrollIntoView({ block: 'nearest' });
+    if (!on) return;
+    // Scroll only the move list, never the page.
+    const box = $('#moves'), top = el.offsetTop, bottom = top + el.offsetHeight;
+    if (top < box.scrollTop) box.scrollTop = top;
+    else if (bottom > box.scrollTop + box.clientHeight) box.scrollTop = bottom - box.clientHeight;
   });
   if (cur === 0) $('#moves').scrollTop = 0;
 }
